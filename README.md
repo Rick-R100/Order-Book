@@ -1,5 +1,3 @@
- # C++ Limit Order Book
-
 # C++ Limit Order Book & Matching Engine
 
 [![CI](https://github.com/Rick-R100/Order-Book/actions/workflows/ci.yml/badge.svg)](https://github.com/Rick-R100/Order-Book/actions/workflows/ci.yml)
