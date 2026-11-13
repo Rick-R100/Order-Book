@@ -15,8 +15,8 @@ if(NOT MSVC)
   target_compile_options(orderbook PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_executable(bench bench/bench.cpp)  add_executable(bench bench/bench.cpp)
-target_link_libraries(bench PRIVATE orderbook) target_link_libraries(bench PRIVATE orderbook)
+add_executable(bench bench/bench.cpp)
+target_link_libraries(bench PRIVATE orderbook)
 
 enable_testing()
 add_executable(test_order_book tests/test_order_book.cpp)
