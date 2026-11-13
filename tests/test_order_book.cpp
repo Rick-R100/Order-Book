@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <random>
 #include <vector>
 
 #include "orderbook/order_book.hpp"
@@ -169,6 +171,154 @@ static void test_modify_price_change_can_match_and_cancel() {
     CHECK(!book.contains(3));
     CHECK(!book.modify(3, 90, 5, out));  // unknown id
 }
+// ------------------------------------------------- differential (random) test
+
+namespace {
+
+struct RefOrder {
+    OrderId id;
+    Side side;
+    Price price;
+    Qty qty;
+    std::uint64_t seq;
+};
+
+// Obviously-correct, O(n) per match. If the fast engine and this agree across
+// hundreds of thousands of random operations, the matching logic is sound.
+class ReferenceBook {
+public:
+    bool add_limit(OrderId id, Side side, Price price, Qty qty, std::vector<Trade>& out) {
+        if (qty == 0 || find(id) != orders_.end()) return false;
+        Qty remaining = qty;
+        match(id, side, true, price, remaining, out);
+        if (remaining > 0) orders_.push_back({id, side, price, remaining, seq_++});
+        return true;
+    }
+    bool add_market(OrderId id, Side side, Qty qty, std::vector<Trade>& out) {
+        if (qty == 0) return false;
+        Qty remaining = qty;
+        match(id, side, false, 0, remaining, out);
+        return true;
+    }
+    bool cancel(OrderId id) {
+        auto it = find(id);
+        if (it == orders_.end()) return false;
+        orders_.erase(it);
+        return true;
+    }
+    bool modify(OrderId id, Price new_price, Qty new_qty, std::vector<Trade>& out) {
+        auto it = find(id);
+        if (it == orders_.end()) return false;
+        if (new_qty == 0) return cancel(id);
+        if (new_price == it->price && new_qty < it->qty) {
+            it->qty = new_qty;
+            return true;
+        }
+        const Side side = it->side;
+        orders_.erase(it);
+        return add_limit(id, side, new_price, new_qty, out);
+    }
+    std::size_t size() const { return orders_.size(); }
+    Qty volume_at(Side side, Price price) const {
+        Qty total = 0;
+        for (const auto& o : orders_)
+            if (o.side == side && o.price == price) total += o.qty;
+        return total;
+    }
+
+private:
+    std::vector<RefOrder> orders_;
+    std::uint64_t seq_ = 0;
+
+    std::vector<RefOrder>::iterator find(OrderId id) {
+        return std::find_if(orders_.begin(), orders_.end(),
+                            [id](const RefOrder& o) { return o.id == id; });
+    }
+
+    void match(OrderId taker, Side side, bool has_limit, Price limit, Qty& remaining,
+               std::vector<Trade>& out) {
+        while (remaining > 0) {
+            auto best = orders_.end();
+            for (auto it = orders_.begin(); it != orders_.end(); ++it) {
+                if (it->side == side) continue;
+                if (has_limit && (side == Side::Buy ? it->price > limit : it->price < limit))
+                    continue;
+                if (best == orders_.end()) {
+                    best = it;
+                    continue;
+                }
+                const bool better_price =
+                    side == Side::Buy ? it->price < best->price : it->price > best->price;
+                const bool tie_earlier = it->price == best->price && it->seq < best->seq;
+                if (better_price || tie_earlier) best = it;
+            }
+            if (best == orders_.end()) return;
+            const Qty traded = std::min(remaining, best->qty);
+            out.push_back(Trade{taker, best->id, best->price, traded, side});
+            remaining -= traded;
+            best->qty -= traded;
+            if (best->qty == 0) orders_.erase(best);
+        }
+    }
+};
+
+}  // namespace
+
+static void test_differential(std::uint64_t seed, int ops) {
+    std::mt19937_64 rng(seed);
+    OrderBook fast;
+    ReferenceBook ref;
+    std::vector<Trade> out_fast, out_ref;
+    std::vector<OrderId> issued;
+    OrderId next_id = 1;
+    bool all_match = true;
+
+    for (int i = 0; i < ops && all_match; ++i) {
+        out_fast.clear();
+        out_ref.clear();
+        const int pick = static_cast<int>(rng() % 100);
+        const Side side = (rng() & 1) ? Side::Buy : Side::Sell;
+        const Price price = 95 + static_cast<Price>(rng() % 11);  // tight band => many crosses
+        const Qty qty = 1 + rng() % 10;
+        bool ok_fast = false, ok_ref = false;
+
+        if (pick < 50) {
+            const OrderId id = next_id++;
+            issued.push_back(id);
+            ok_fast = fast.add_limit(id, side, price, qty, out_fast);
+            ok_ref = ref.add_limit(id, side, price, qty, out_ref);
+        } else if (pick < 60) {
+            const OrderId id = next_id++;
+            ok_fast = fast.add_market(id, side, qty, out_fast);
+            ok_ref = ref.add_market(id, side, qty, out_ref);
+        } else if (pick < 85 && !issued.empty()) {
+            const OrderId id = issued[rng() % issued.size()];  // may already be filled
+            ok_fast = fast.cancel(id);
+            ok_ref = ref.cancel(id);
+        } else if (!issued.empty()) {
+            const OrderId id = issued[rng() % issued.size()];
+            const Qty new_qty = rng() % 12;  // includes 0 => cancel
+            ok_fast = fast.modify(id, price, new_qty, out_fast);
+            ok_ref = ref.modify(id, price, new_qty, out_ref);
+        } else {
+            continue;
+        }
+
+        all_match = ok_fast == ok_ref && out_fast.size() == out_ref.size();
+        for (std::size_t t = 0; all_match && t < out_fast.size(); ++t)
+            all_match = same_trade(out_fast[t], out_ref[t]);
+        all_match = all_match && fast.order_count() == ref.size();
+    }
+    CHECK(all_match);
+
+    for (Price p = 95; p <= 105; ++p) {
+        CHECK(fast.volume_at(Side::Buy, p) == ref.volume_at(Side::Buy, p));
+        CHECK(fast.volume_at(Side::Sell, p) == ref.volume_at(Side::Sell, p));
+    }
+    const auto bb = fast.best_bid();
+    const auto ba = fast.best_ask();
+    if (bb && ba) CHECK(*bb < *ba);  // a resting book must never be crossed
+}
 int main() 
 {
     test_resting_and_best_prices();
@@ -183,6 +333,7 @@ int main()
     test_rejects_bad_input();
     test_modify_keeps_priority_only_on_size_decrease();
     test_modify_price_change_can_match_and_cancel();
+    for (std::uint64_t seed = 1; seed <= 20; ++seed) test_differential(seed, 20000);
     std::printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
